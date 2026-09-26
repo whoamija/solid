@@ -296,18 +296,78 @@ def list_clients(query: str | None = None) -> list[dict[str, Any]]:
     return members
 
 
+def contact_iri(client: dict[str, Any], contact: dict[str, Any]) -> str:
+    """SolidInvoice wants /api/clients/{client}/contact/{id} on quote.users."""
+    existing = contact.get("@id")
+    if isinstance(existing, str) and "/contact" in existing:
+        return existing
+    cid = iri_id(client.get("@id") or client.get("id"))
+    kid = iri_id(contact.get("@id") or contact.get("id"))
+    if cid and kid:
+        return f"/api/clients/{cid}/contact/{kid}"
+    if existing:
+        return str(existing)
+    return ""
+
+
 def get_client_contacts(client: dict[str, Any]) -> list[dict[str, Any]]:
     cid = iri_id(client.get("@id") or client.get("id"))
-    if not cid:
-        return []
-    data = si_json("GET", f"/api/clients/{cid}/contacts")
-    members = hydra_members(data)
-    if members:
-        return members
-    embedded = client.get("contacts") or client.get("users") or []
-    if isinstance(embedded, list):
-        return [x for x in embedded if isinstance(x, dict)]
-    return []
+    collected: list[dict[str, Any]] = []
+    if cid:
+        for path, params in (
+            (f"/api/clients/{cid}/contacts", None),
+            ("/api/contacts", {"client": f"/api/clients/{cid}", "itemsPerPage": 50}),
+        ):
+            try:
+                data = si_json("GET", path, params=params)
+            except RuntimeError:
+                continue
+            collected.extend(hydra_members(data))
+            if collected:
+                break
+    for key in ("contacts", "users"):
+        embedded = client.get(key) or []
+        if isinstance(embedded, list):
+            collected.extend(x for x in embedded if isinstance(x, dict))
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for row in collected:
+        key = iri_id(row)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(row)
+    return out
+
+
+def ensure_client_contact(client: dict[str, Any]) -> list[str]:
+    """Return quote/invoice `users` IRIs. Create a contact if the client has none."""
+    contacts = get_client_contacts(client)
+    if not contacts:
+        cid = iri_id(client.get("@id") or client.get("id"))
+        first, last = split_person_name(str(client.get("name") or "Client"))
+        email = (
+            client.get("email")
+            or (client.get("_contact") or {}).get("email")
+            or f"noreply+{cid or 'client'}@placeholder.local"
+        )
+        body = {"firstName": first, "lastName": last or first, "email": email}
+        created = None
+        for path in (f"/api/clients/{cid}/contacts", "/api/contacts"):
+            payload = dict(body)
+            if path == "/api/contacts":
+                payload["client"] = client.get("@id") or f"/api/clients/{cid}"
+            try:
+                created = si_json("POST", path, json=payload)
+                break
+            except RuntimeError as exc:
+                log.warning("Contact create %s failed: %s", path, exc)
+        if created:
+            contacts = [created]
+            client["_contact"] = created
+    iris = [contact_iri(client, c) for c in contacts]
+    return [u for u in iris if u]
 
 
 def create_client(name: str, email: str, phone: str) -> dict[str, Any]:
@@ -318,21 +378,32 @@ def create_client(name: str, email: str, phone: str) -> dict[str, Any]:
     }
     created = si_json("POST", "/api/clients", json=payload)
     cid = iri_id(created.get("@id") or created.get("id"))
+    created["email"] = email.strip()
     contact_body = {
-        "client": created.get("@id") or f"/api/clients/{cid}",
         "firstName": first,
-        "lastName": last,
+        "lastName": last or first,
         "email": email.strip(),
     }
     if phone.strip():
-        # Cloud versions differ; extra fields are ignored if unsupported.
         contact_body["phone"] = phone.strip()
-    try:
-        contact = si_json("POST", "/api/contacts", json=contact_body)
+    contact = None
+    last_err = None
+    for path, extra in (
+        (f"/api/clients/{cid}/contacts", {}),
+        ("/api/contacts", {"client": created.get("@id") or f"/api/clients/{cid}"}),
+    ):
+        try:
+            payload_c = dict(contact_body)
+            payload_c.update(extra)
+            contact = si_json("POST", path, json=payload_c)
+            break
+        except RuntimeError as exc:
+            last_err = exc
+            log.warning("Contact create %s failed: %s", path, exc)
+    if contact:
         created["_contact"] = contact
-    except RuntimeError as exc:
-        log.warning("Contact create failed: %s", exc)
-        created["_contact_error"] = str(exc)
+    elif last_err:
+        created["_contact_error"] = str(last_err)
     return created
 
 
@@ -372,20 +443,31 @@ def line_payloads(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def create_document(kind: str, client: dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
     cid = client.get("@id") or f"/api/clients/{iri_id(client)}"
-    contacts = get_client_contacts(client)
-    users = []
-    for c in contacts:
-        iri = c.get("@id")
-        if iri:
-            users.append(iri)
+    users = ensure_client_contact(client)
+    if not users:
+        raise RuntimeError(
+            "This client has no contact. SolidInvoice will not save a quote "
+            "without one. Use /client Name, email, phone so a contact is created."
+        )
     body: dict[str, Any] = {
         "client": cid,
         "lines": line_payloads(items),
+        "users": users,
     }
-    if users:
-        body["users"] = users
     path = "/api/quotes" if kind == "quote" else "/api/invoices"
-    doc = si_json("POST", path, json=body)
+    try:
+        doc = si_json("POST", path, json=body)
+    except RuntimeError as exc:
+        # Some Cloud builds want /api/contacts/{id} instead of nested contact IRI.
+        if "users" in str(exc).lower():
+            alt = []
+            for u in users:
+                kid = iri_id(u)
+                alt.append(f"/api/contacts/{kid}")
+            body["users"] = alt
+            doc = si_json("POST", path, json=body)
+        else:
+            raise
     # Move draft → pending/sent when a transition exists.
     uid = iri_id(doc)
     for transition in ("accept", "send", "pending"):
