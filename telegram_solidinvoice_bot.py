@@ -52,7 +52,8 @@ TG_TOKEN = os.environ.get("TG_TOKEN", "").strip()
 SI_URL = os.environ.get("SI_URL", "").strip().rstrip("/")
 SI_TOKEN = os.environ.get("SI_TOKEN", "").strip()
 SI_CURRENCY = os.environ.get("SI_CURRENCY", "JMD").strip().upper() or "JMD"
-SI_DECIMALS = int(os.environ.get("SI_DECIMALS", "2"))
+# 0 = send the number typed in chat. Cloud was treating *100 as JMD millions.
+SI_DECIMALS = int(os.environ.get("SI_DECIMALS", "0"))
 ALLOWED_RAW = os.environ.get("ALLOWED_USER_IDS", "").strip()
 ALLOWED_USER_IDS = {int(x) for x in ALLOWED_RAW.split(",") if x.strip().isdigit()}
 
@@ -101,7 +102,8 @@ Same thing one line:
 /unpaid Jane — unpaid for that client name
 /paid 88 — mark invoice 88 paid
 
-Prices you type are *normal money* (4275 = 4275.00). The API stores minor units.
+Prices you type are saved as typed (`12500` = JMD 12,500).
+Set `SI_DECIMALS=2` only if Cloud shows amounts 100 times too small.
 """
 
 
@@ -468,7 +470,6 @@ def create_document(kind: str, client: dict[str, Any], items: list[dict[str, Any
             doc = si_json("POST", path, json=body)
         else:
             raise
-    # Move draft → pending/sent when a transition exists.
     uid = iri_id(doc)
     for transition in ("accept", "send", "pending"):
         try:
@@ -476,12 +477,52 @@ def create_document(kind: str, client: dict[str, Any], items: list[dict[str, Any
             break
         except RuntimeError:
             continue
-    return doc
+    try:
+        doc = si_json("GET", f"{path}/{uid}")
+    except RuntimeError:
+        pass
+    return assign_human_id(kind, doc)
+
+
+def next_human_id(kind: str) -> str:
+    path = "/api/quotes" if kind == "quote" else "/api/invoices"
+    field = "quoteId" if kind == "quote" else "invoiceId"
+    data = si_json("GET", path, params={"itemsPerPage": 100})
+    nums: list[int] = []
+    for row in hydra_members(data):
+        raw = str(row.get(field) or "").strip()
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if digits:
+            nums.append(int(digits))
+    nxt = (max(nums) + 1) if nums else 1
+    return f"{nxt:04d}"
+
+
+def assign_human_id(kind: str, doc: dict[str, Any]) -> dict[str, Any]:
+    """API creates often leave quoteId/invoiceId empty; UI then shows a blank number."""
+    field = "quoteId" if kind == "quote" else "invoiceId"
+    current = str(doc.get(field) or "").strip()
+    if current:
+        return doc
+    uid = iri_id(doc)
+    path = "/api/quotes" if kind == "quote" else "/api/invoices"
+    number = next_human_id(kind)
+    try:
+        updated = si_json("PATCH", f"{path}/{uid}", json={field: number})
+        return updated or {**doc, field: number}
+    except RuntimeError as exc:
+        log.warning("Could not set %s: %s", field, exc)
+        return {**doc, field: number}
 
 
 def convert_quote(quote: dict[str, Any]) -> dict[str, Any]:
     uid = iri_id(quote)
-    return si_json("POST", f"/api/quotes/{uid}/invoice", json={})
+    invoice = si_json("POST", f"/api/quotes/{uid}/invoice", json={})
+    try:
+        invoice = si_json("GET", f"/api/invoices/{iri_id(invoice)}")
+    except RuntimeError:
+        pass
+    return assign_human_id("invoice", invoice)
 
 
 def mark_paid(invoice: dict[str, Any]) -> dict[str, Any]:
@@ -559,29 +600,30 @@ def unpaid_invoices(client_name: str | None = None) -> list[dict[str, Any]]:
 
 
 def try_pdf(kind: str, doc: dict[str, Any]) -> bytes | None:
+    """SolidInvoice serves PDFs as /quotes/view/{ulid}.pdf and /view/quote/{uuid}.pdf."""
     uid = iri_id(doc)
-    uuid = doc.get("uuid") or ""
-    number = doc.get("invoiceId") if kind == "invoices" else doc.get("quoteId")
+    uuid = str(doc.get("uuid") or "").strip()
+    singular = "quote" if kind in ("quotes", "quote") else "invoice"
+    plural = "quotes" if singular == "quote" else "invoices"
     candidates = [
-        f"/api/{kind}/{uid}/pdf",
-        f"/api/{kind}/{uid}?_format=pdf",
-        f"/{kind}/{uid}/pdf",
-        f"/invoices/pdf/{uid}" if kind == "invoices" else f"/quotes/pdf/{uid}",
+        f"/{plural}/view/{uid}.pdf",
+        f"/{plural}/view/{uid}",
+        f"/view/{singular}/{uuid}.pdf" if uuid else "",
+        f"/view/{singular}/{uuid}" if uuid else "",
+        f"/api/{plural}/{uid}.pdf",
+        f"/api/{plural}/{uid}?_format=pdf",
     ]
-    if uuid:
-        candidates.append(f"/api/{kind}/{uuid}/pdf")
-    if number:
-        candidates.append(f"/api/{kind}/{number}/pdf")
-    for path in candidates:
+    for path in [p for p in candidates if p]:
         try:
             resp = si_request(
                 "GET",
                 path,
                 headers={"Accept": "application/pdf"},
+                params={"_format": "pdf"} if "?" not in path else None,
             )
-            ctype = resp.headers.get("Content-Type", "")
             if resp.status_code == 200 and (
-                "pdf" in ctype.lower() or (resp.content[:5] == b"%PDF-")
+                "pdf" in resp.headers.get("Content-Type", "").lower()
+                or (resp.content[:5] == b"%PDF-")
             ):
                 return resp.content
         except Exception:
@@ -590,12 +632,15 @@ def try_pdf(kind: str, doc: dict[str, Any]) -> bytes | None:
 
 
 def describe_doc(kind: str, doc: dict[str, Any]) -> str:
-    number = doc.get("invoiceId") or doc.get("quoteId") or iri_id(doc)
+    field = "invoiceId" if kind.startswith("invoice") else "quoteId"
+    number = str(doc.get(field) or "").strip()
+    label = number if number else "(number pending)"
     status = doc.get("status", "?")
     total = from_minor(doc.get("total") or doc.get("payableAmount") or 0)
     client = doc.get("client")
     cname = client.get("name") if isinstance(client, dict) else str(client or "")
-    return f"{kind[:-1].title()} *{number}* — {status} — {format_money(total)}\nClient: {cname}"
+    title = "Invoice" if kind.startswith("invoice") else "Quote"
+    return f"{title} *{label}* — {status} — {format_money(total)}\nClient: {cname}"
 
 
 # ---------------------------------------------------------------------------
